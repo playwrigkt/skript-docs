@@ -39,6 +39,7 @@ compileTestKotlin {
 
 dependencies {
   compile "playwrigkt.skript:skript-api:+"
+  compile "playwrigkt.skript:skript-impl-vertx:+"
   compile("io.arrow-kt:ank-core:$ank_version") {
     exclude group: 'io.arrow-kt', module: 'arrow-core'
   }
