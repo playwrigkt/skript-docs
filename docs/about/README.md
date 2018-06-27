@@ -310,27 +310,30 @@ First, lets implement a sql query with skript:
 ```kotlin:ank
 import arrow.core.Try
 import playwrigkt.skript.Skript
-import playwrigkt.skript.ex.join
-import playwrigkt.skript.result.AsyncResult
 import playwrigkt.skript.sql.SqlCommand
+import playwrigkt.skript.sql.SqlQueryMapping
 import playwrigkt.skript.sql.SqlSkript
 import playwrigkt.skript.sql.SqlStatement
-import playwrigkt.skript.sql.transaction.SqlTransactionSkript
 import playwrigkt.skript.troupe.SqlTroupe
 
-val authenticate: Skript<String, String, SqlTroupe> = SqlSkript.query(
-        toSql = Skript.map {
-            SqlCommand.Query(SqlStatement.Parameterized(
-                    query = "SELECT user_id FROM user_session where session_key = ? and expiration > now()",
-                    params= listOf(it)))
-        },
-        mapResult = Skript.mapTry {
-            if(!it.result.hasNext()) {
-                Try { it.result.next().getString("user_id") }
-            } else {
-                Try.Failure<String>(RuntimeException("not authorized"))
-            }
-        })
+
+data class SessionKeyAndInput<T>(val sessionKey: String, val input:  T)
+data class AuthSessionAndInput<I>(val userId: String, val input: I)
+
+fun <I> authenticate(): Skript<SessionKeyAndInput<I>, AuthSessionAndInput<I>, SqlTroupe> =
+        SqlSkript.query(SqlQueryMapping.new(
+                {
+                    SqlCommand.Query(SqlStatement.Parameterized(
+                            query = "SELECT user_id FROM user_session where session_key = ? and expiration > now()",
+                            params= listOf(it.sessionKey)))
+                },
+                { sessionKeyAndInput, resultSet ->
+                    if(!resultSet.result.hasNext()) {
+                        Try { AuthSessionAndInput(resultSet.result.next().getString("user_id"), sessionKeyAndInput.input) }
+                    } else {
+                        Try.Failure(RuntimeException("not authorized"))
+                    }
+                }))
 ```
 
 The query is  itself a skript.  A skript is a function, with an input, and output, and a `Troupe` which  can perform
@@ -339,24 +342,26 @@ part of that script).  This particular skript defines a sql query.  The first  a
 that maps to  a `SqlCommand`, which the `SQLTroupe` knows  how to execute.  The second skript defines how to map from
 the result of the sqlQuery - in this case it just gets a single field from the resultSet.
 
-The other two queries can also be implemented in a similar manner:
+The other two queries can also be implemented in a similar manner, notice how the signature for `query` used  in getUser
+is slightly different than authenticate and authorize - it passes skripts in to do the mapping instead of functions:
 
 ```kotlin:ank
-val authorize: Skript<Pair<String, String>, Unit, SqlTroupe> = SqlSkript.query(
-        toSql = Skript.map {
-            SqlCommand.Query(SqlStatement.Parameterized(
-                    query = "SELECT * from user_priviledge where user_id = ? AND permission = ?",
-                    params = listOf(it.first, it.second)))
-        },
-        mapResult = Skript.mapTry {
-            if(it.result.hasNext()) {
-                Try.Success(Unit)
-            } else {
-                Try.Failure(RuntimeException("not authenticated"))
-            }
-        })
+fun <I> authorize(permission: String): Skript<AuthSessionAndInput<I>, AuthSessionAndInput<I>, SqlTroupe> =
+        SqlSkript.query(SqlQueryMapping.new(
+                {
+                    SqlCommand.Query(SqlStatement.Parameterized(
+                            query = "SELECT * from user_permission where user_id = ? AND permission = ?",
+                            params = listOf(it.userId, permission)))
+                }, { authSessionAndInput, resultSet  ->
+                    if(resultSet.result.hasNext()) {
+                        Try.Success(authSessionAndInput)
+                    } else {
+                        Try.Failure(RuntimeException("not authenticated"))
+                    }
+                }))
 
-val getUser: Skript<String, UserProfile, SqlTroupe> = SqlSkript.query(
+val getUser: Skript<String, UserProfile, SqlTroupe> =
+        SqlSkript.query(
         toSql = Skript.map {
             SqlCommand.Query(SqlStatement.Parameterized(
                     query = "SELECT * from user_profile where user_id = ?",
@@ -378,79 +383,15 @@ Finally, skript allows these functions to be chained together in a convenient wa
 
 
 ```kotlin:ank
-data class SessionKeyAndInput<T>(val sessionKey: String, val input:  T)
+import playwrigkt.skript.ex.andThen
+import playwrigkt.skript.sql.transaction.SqlTransactionSkript
 
 val queryUser: Skript<SessionKeyAndInput<String>, UserProfile, SqlTroupe> =
-        SqlTransactionSkript.transaction(Skript.identity<SessionKeyAndInput<String>, SqlTroupe>()
-                .split(Skript.identity<SessionKeyAndInput<String>, SqlTroupe>()
-                        .map { it.sessionKey }
-                        .compose(authenticate)
-                        .map { Pair(it, "read.user") }
-                        .compose(authorize))
-                .join { sessionKeyAndInput, unit -> sessionKeyAndInput.sessionKey }
-                .compose(getUser))
-```
-#### Skript Breakdown
-Breaking this down line by line:
-
-First, we declare the property, and the input, output, and troupe of the skript.
-
-```kotlin
-val queryUser: Skript<SessionKeyAndInput<String>, UserProfile, SqlTroupe> =
-```
-
-Second, we declalre that we are going to perform a sql transaction.  This will automatically handle
-acquiring a sql connection, and commiting, rolling back, and closing in  the appropriate cases. (i.e. always close,
-commit on success, and rollback on failure)
-
-This line also creates an "identity" skript.  An identity  skript performs no transformation, and is a  good way
-to start a skript chain.
-
-```kotlin
-//declare that  we will start  a trasnaction
-SqlTransactionSkript.transaction(Skript.identity<SessionKeyAndInput<String>, SqlTroupe>(
-```
-
-Then, we "split" the skript. Split is an alias for "both", which runs two skripts in parallel.
-Split is equivalent to running both with an identity skript and the skript that is  passed in.  Split is used here
-because we need the original input to actuallly get the user later, but the authentication would swallow that value
-otherwise.
-
-Since split takes in a skript as input, that skript is initiallized with `identity` to clarify a new
-skript has been created.
- 
-```kotlin
-    .split(Skript.identity<SessionKeyAndInput<String>, SqlTroupe>()
-```
-
-Transform the input  into the sessionKey, and then run the authenticate query:
-
-```kotlin
-            .map { it.sessionKey }
-            .compose(authenticate)
-```
-
-Then create a pair of  the user_id (result  from authorize), and the permission string to authorize, then run the 
-authorize query:
-
-```kotlin
-            .map { Pair(it, "read.user") }
-            .compose(authorize))
-```
-
-Join back to the parent skript and map to the input value.  Here `unit` is the output of the authorization and
-authentication skript passed into `split`, and `sessionKeyAndInput` was the value passed into `split`.
-
-```kotlin
-    //join the skript - get the input before split, and the result after spit finishes
-    .join { sessionKeyAndInput, unit -> sessionKeyAndInput.input }
-```
-
-Finallly, get the user with the id that was passed in:
-
-```kotlin
-    //run the getUser skript
-    .compose(getUser))
+        SqlTransactionSkript.transaction(
+                authenticate<String>()
+                        .andThen(authorize("read.user"))
+                        .map { it.input }
+                        .andThen(getUser))
 ```
 
 By breaking this skript down line by line, the business logic of the application is readily apparent.  Even though IO
@@ -460,6 +401,49 @@ free of clutter.
 In addition to readability,  errors are handled cleanly - if any part of the skript throws an exception, it will be 
 exposed via the result and execution will short circuit.
 
-## Executing a  skript
+## Adding additionaal functionality
 
-Executing a skript
+Lets say we want to serialize our values, and pubish an event to a queue.
+
+To do so, we need to expand our troupe.  A SqlTroupe can executte sql via the `SqlPerformer`.  There are similar
+semantics for other Troupes:
+
+```kotlin:ank
+import playwrigkt.skript.troupe.QueuePublishTroupe
+import playwrigkt.skript.troupe.SerializeTroupe
+
+data class AppTroupe(val sqlTroupe: SqlTroupe, val queuePublishTroupe: QueuePublishTroupe, val serializeTroupe: SerializeTroupe):
+        SqlTroupe by sqlTroupe,
+        QueuePublishTroupe by queuePublishTroupe,
+        SerializeTroupe by serializeTroupe
+```
+
+and a skript to write to the queue:
+
+```kotlin:ank
+import playwrigkt.skript.ex.join
+import playwrigkt.skript.ex.publish
+import playwrigkt.skript.ex.serialize
+import playwrigkt.skript.queue.QueueMessage
+
+fun <I> publish(target: String): Skript<I, I, AppTroupe> =
+        Skript.identity<I, AppTroupe>()
+                .split(Skript.identity<I, AppTroupe>()
+                        .serialize()
+                        .publish { QueueMessage(target, it) }
+                )
+                .join { userProfile, _ -> userProfile }
+```
+
+Finally, we slightly modify our api skript to use the new `AppTroupe` and the `publishSkript`:
+
+```kotllin:ank
+val queryUser: Skript<SessionKeyAndInput<String>, UserProfile, AppTroupe> =
+        SqlTransactionSkript.transaction(
+                Skript.identity<SessionKeyAndInput<String>, AppTroupe>()
+                        .andThen(authenticate())
+                        .andThen(authorize("read.user"))
+                        .map { it.input }
+                        .andThen(getUser)
+                        .andThen(publish("user.read")))
+```

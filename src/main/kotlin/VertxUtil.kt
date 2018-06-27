@@ -7,23 +7,23 @@ import io.vertx.ext.jdbc.JDBCClient
 import io.vertx.ext.sql.SQLClient
 import io.vertx.ext.sql.SQLConnection
 import playwrigkt.skript.Skript
+import playwrigkt.skript.ex.andThen
 import playwrigkt.skript.ex.join
+import playwrigkt.skript.ex.publish
+import playwrigkt.skript.ex.serialize
+import playwrigkt.skript.queue.QueueMessage
 import playwrigkt.skript.result.AsyncResult
 import playwrigkt.skript.sql.SqlCommand
+import playwrigkt.skript.sql.SqlQueryMapping
 import playwrigkt.skript.sql.SqlSkript
 import playwrigkt.skript.sql.SqlStatement
 import playwrigkt.skript.sql.transaction.SqlTransactionSkript
+import playwrigkt.skript.troupe.QueuePublishTroupe
+import playwrigkt.skript.troupe.SerializeTroupe
 import playwrigkt.skript.troupe.SqlTroupe
 import playwrigkt.skript.troupe.VertxSqlTroupe
 
 
-fun main() {
-    val vertx = Vertx.vertx()
-    val eventBus = vertx.eventBus()
-    val sqlClient = JDBCClient.createShared(vertx, JsonObject())
-
-
-}
 
 val authQuery = "SELECT session_key, user_id, expiration FROM user_session where session_key = ? and expiration > now()"
 
@@ -52,36 +52,45 @@ fun queryUser(sessionKey: String, userId: String, sqlClient: SQLClient): Future<
     }
 }
 
+data class AppTroupe(val sqlTroupe: SqlTroupe, val queuePublishTroupe: QueuePublishTroupe, val serializeTroupe: SerializeTroupe):
+        SqlTroupe by sqlTroupe,
+        QueuePublishTroupe by queuePublishTroupe,
+        SerializeTroupe by serializeTroupe
 
-val authenticate: Skript<String, String, SqlTroupe> = SqlSkript.query(
-        toSql = Skript.map {
-            SqlCommand.Query(SqlStatement.Parameterized(
-                    query = "SELECT user_id FROM user_session where session_key = ? and expiration > now()",
-                    params= listOf(it)))
-        },
-        mapResult = Skript.mapTry {
-            if(!it.result.hasNext()) {
-                Try { it.result.next().getString("user_id") }
-            } else {
-                Try.Failure<String>(RuntimeException("not authorized"))
-            }
-        })
 
-val authorize: Skript<Pair<String, String>, Unit, SqlTroupe> = SqlSkript.query(
-        toSql = Skript.map {
-            SqlCommand.Query(SqlStatement.Parameterized(
-                    query = "SELECT * from user_priviledge where user_id = ? AND permission = ?",
-                    params = listOf(it.first, it.second)))
-        },
-        mapResult = Skript.mapTry {
-            if(it.result.hasNext()) {
-                Try.Success(Unit)
-            } else {
-                Try.Failure(RuntimeException("not authenticated"))
-            }
-        })
+fun <I> authenticate(): Skript<SessionKeyAndInput<I>, AuthSessionAndInput<I>, SqlTroupe> =
+        SqlSkript.query(SqlQueryMapping.new(
+                {
+                    SqlCommand.Query(SqlStatement.Parameterized(
+                            query = "SELECT user_id FROM user_session where session_key = ? and expiration > now()",
+                            params= listOf(it.sessionKey)))
+                },
+                { sessionKeyAndInput, resultSet ->
+                    if(!resultSet.result.hasNext()) {
+                        Try { AuthSessionAndInput(resultSet.result.next().getString("user_id"), sessionKeyAndInput.input) }
+                    } else {
+                        Try.Failure(RuntimeException("not authorized"))
+                    }
+                }))
 
-val getUser: Skript<String, UserProfile, SqlTroupe> = SqlSkript.query(
+data class AuthSessionAndInput<I>(val userId: String, val input: I)
+
+fun <I> authorize(permission: String): Skript<AuthSessionAndInput<I>, AuthSessionAndInput<I>, SqlTroupe> =
+        SqlSkript.query(SqlQueryMapping.new(
+                {
+                    SqlCommand.Query(SqlStatement.Parameterized(
+                            query = "SELECT * from user_priviledge where user_id = ? AND permission = ?",
+                            params = listOf(it.userId, permission)))
+                }, { authSessionAndInput, resultSet  ->
+                    if(resultSet.result.hasNext()) {
+                        Try.Success(authSessionAndInput)
+                    } else {
+                        Try.Failure(RuntimeException("not authenticated"))
+                    }
+                }))
+
+val getUser: Skript<String, UserProfile, SqlTroupe> =
+        SqlSkript.query(
         toSql = Skript.map {
             SqlCommand.Query(SqlStatement.Parameterized(
                     query = "SELECT * from user_profile where user_id = ?",
@@ -98,24 +107,33 @@ val getUser: Skript<String, UserProfile, SqlTroupe> = SqlSkript.query(
             }
         })
 
+fun <I> publish(target: String): Skript<I, I, AppTroupe> =
+        Skript.identity<I, AppTroupe>()
+                .split(Skript.identity<I, AppTroupe>()
+                        .serialize()
+                        .publish { QueueMessage(target, it) }
+                )
+                .join { userProfile, _ -> userProfile }
+
 data class SessionKeyAndInput<T>(val sessionKey: String, val input:  T)
-val queryUser: Skript<SessionKeyAndInput<String>, UserProfile, SqlTroupe> =
-        SqlTransactionSkript.transaction(Skript.identity<SessionKeyAndInput<String>, SqlTroupe>()
-                .split(Skript.identity<SessionKeyAndInput<String>, SqlTroupe>()
-                        .map { it.sessionKey }
-                        .compose(authenticate)
-                        .map { Pair(it, "read.user") }
-                        .compose(authorize))
-                .join { sessionKeyAndInput, unit -> sessionKeyAndInput.input }
-                .compose(getUser))
 
-val sqlClient: SQLClient = TODO("create sql client")
-val troupe = VertxSqlTroupe(sqlClient)
-val result = queryUser.run(SessionKeyAndInput("sessionKey", "userId"), troupe)
+val queryUser: Skript<SessionKeyAndInput<String>, UserProfile, AppTroupe> =
+        SqlTransactionSkript.transaction(
+                Skript.identity<SessionKeyAndInput<String>, AppTroupe>()
+                        .andThen(authenticate())
+                        .andThen(authorize("read.user"))
+                        .map { it.input }
+                        .andThen(getUser)
+                        .andThen(publish("user.read")))
 
-fun execute(sqlTroupe: SqlTroupe, sessionKey: String, userId: String): AsyncResult<UserProfile> {
-    return queryUser.run(SessionKeyAndInput(sessionKey, userId), sqlTroupe)
-}
+
+//val sqlClient: SQLClient = TODO("create sql client")
+//val troupe = VertxSqlTroupe(sqlClient)
+//val result = queryUser.run(SessionKeyAndInput("sessionKey", "userId"), troupe)
+//
+//fun execute(sqlTroupe: SqlTroupe, sessionKey: String, userId: String): AsyncResult<UserProfile> {
+//    return queryUser.run(SessionKeyAndInput(sessionKey, userId), sqlTroupe)
+//}
 //fun queryUser(sessionKey: String, userId: String, sqlClient: SQLClient): Future<UserProfile> {
 //    return getConnection(sqlClient)
 //            .compose { sqlConnection ->
