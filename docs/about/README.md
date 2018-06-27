@@ -412,6 +412,10 @@ semantics for other Troupes:
 import playwrigkt.skript.troupe.QueuePublishTroupe
 import playwrigkt.skript.troupe.SerializeTroupe
 
+interface AppTroupe: SqlTroupe, QueuePublishTroupe, SerializeTroupe
+```
+
+```kotlin
 data class AppTroupe(val sqlTroupe: SqlTroupe, val queuePublishTroupe: QueuePublishTroupe, val serializeTroupe: SerializeTroupe):
         SqlTroupe by sqlTroupe,
         QueuePublishTroupe by queuePublishTroupe,
@@ -420,7 +424,7 @@ data class AppTroupe(val sqlTroupe: SqlTroupe, val queuePublishTroupe: QueuePubl
 
 and a skript to write to the queue:
 
-```kotlin:ank
+```kotlin
 import playwrigkt.skript.ex.join
 import playwrigkt.skript.ex.publish
 import playwrigkt.skript.ex.serialize
@@ -437,7 +441,7 @@ fun <I> publish(target: String): Skript<I, I, AppTroupe> =
 
 Finally, we slightly modify our api skript to use the new `AppTroupe` and the `publishSkript`:
 
-```kotllin:ank
+```kotlin
 val queryUser: Skript<SessionKeyAndInput<String>, UserProfile, AppTroupe> =
         SqlTransactionSkript.transaction(
                 Skript.identity<SessionKeyAndInput<String>, AppTroupe>()
